@@ -26,10 +26,45 @@ class LanceMapDataset(Dataset):
             columns: Optional list of column names to load, or dict of column names to SQL expressions
             transform: Optional transform to apply to the data
         """
-        self.dataset = lance.dataset(dataset_path)
+        self.dataset_path = dataset_path
         self.columns = columns
         self.transform = transform
+        self._initialize_dataset()
+        
+    def _initialize_dataset(self):
+        """Initialize dataset with storage options."""
+        import os
+        
+        storage_options = {
+            "client_max_retries": "30", 
+            "client_retry_timeout": "1800",
+            "timeout": "60s",
+            "connect_timeout": "30s",
+            "aws_region": "us-west-2"
+        }
+        
+        # Check for AWS credentials in environment
+        if os.environ.get('AWS_ACCESS_KEY_ID'):
+            storage_options["aws_access_key_id"] = os.environ['AWS_ACCESS_KEY_ID']
+        if os.environ.get('AWS_SECRET_ACCESS_KEY'):
+            storage_options["aws_secret_access_key"] = os.environ['AWS_SECRET_ACCESS_KEY']
+        if os.environ.get('AWS_SESSION_TOKEN'):
+            storage_options["aws_session_token"] = os.environ['AWS_SESSION_TOKEN']
+            
+        self.dataset = lance.dataset(self.dataset_path, storage_options=storage_options)
         self._len = self.dataset.count_rows()
+        
+    def __getstate__(self):
+        """Prepare for pickling."""
+        state = self.__dict__.copy()
+        del state['dataset']
+        del state['_len']
+        return state
+        
+    def __setstate__(self, state):
+        """Restore after pickling."""
+        self.__dict__.update(state)
+        self._initialize_dataset()
         
     def __len__(self):
         """Return the total number of rows in the dataset."""

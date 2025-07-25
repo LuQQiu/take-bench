@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Benchmark script for LanceDB remote PyTorch DataLoader.
-Tests the same configurations as the storage version but using remote take API.
+Simple benchmark script for Lance PyTorch DataLoader.
+Automatically creates datasets based on test dimensions.
 """
 
 import multiprocessing
@@ -16,42 +16,91 @@ import os
 os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['MKL_NUM_THREADS'] = '1'
 
-# Set higher retry limits for S3 object store
-os.environ['OBJECT_STORE_CLIENT_MAX_RETRIES'] = '120'  # Default is 10
-os.environ['OBJECT_STORE_CLIENT_RETRY_TIMEOUT'] = '18000'  # 30 minutes (default is 180s)
-
-import lancedb
+import lance
 import torch
 from torch.utils.data import DataLoader
 import numpy as np
 import pyarrow as pa
 import time
+import os
+import shutil
 import csv
 from datetime import datetime
 import gc
 
-from lancedb_map_dataset import LanceDBMapDataset
+from lance_map_dataset import LanceMapDataset
 
 
-# REMOVED create_remote_dataset_if_needed function for safety
-# This script now only works with existing tables
+def create_dataset_if_needed(num_rows, num_cols, col_size_bytes, dataset_path):
+    """Create dataset if it doesn't exist."""
+    try:
+        if dataset_path.startswith('s3://'):
+            dataset = lance.dataset(dataset_path, storage_options={
+                "client_max_retries": "30", 
+                "client_retry_timeout": "1800",
+                "timeout": "60s",
+                "connect_timeout": "30s",
+                "aws_region": "us-west-2"
+            })
+        else:
+            dataset = lance.dataset(dataset_path)
+        if dataset.count_rows() == num_rows:
+            print(f"Dataset already exists: {dataset_path} with {num_rows} rows")
+            return
+    except Exception:
+        pass  # Dataset doesn't exist, will create
+    
+    print(f"Creating dataset: {num_rows} rows, {num_cols} cols, {col_size_bytes}B per col")
+    
+    # Generate data in batches
+    batch_size = min(10000, num_rows)
+    rows_written = 0
+    
+    while rows_written < num_rows:
+        batch_rows = min(batch_size, num_rows - rows_written)
+        
+        # Create batch data
+        data = {'id': np.arange(rows_written, rows_written + batch_rows, dtype=np.int64)}
+        
+        for i in range(num_cols):
+            if col_size_bytes <= 8:
+                data[f'col_{i}'] = np.random.randint(0, 1000, size=batch_rows, dtype=np.int32)
+            else:
+                data[f'col_{i}'] = [np.random.bytes(col_size_bytes) for _ in range(batch_rows)]
+        
+        table = pa.Table.from_pydict(data)
+        
+        if rows_written == 0:
+            if dataset_path.startswith('s3://'):
+                lance.write_dataset(table, dataset_path, mode="create", storage_options={
+                    "timeout": "60s",
+                    "connect_timeout": "30s",
+                    "aws_region": "us-west-2"
+                })
+            else:
+                lance.write_dataset(table, dataset_path, mode="create")
+        else:
+            if dataset_path.startswith('s3://'):
+                lance.write_dataset(table, dataset_path, mode="append", storage_options={
+                    "timeout": "60s",
+                    "connect_timeout": "30s",
+                    "aws_region": "us-west-2"
+                })
+            else:
+                lance.write_dataset(table, dataset_path, mode="append")
+        
+        rows_written += batch_rows
+        print(f"  Written {rows_written}/{num_rows} rows")
+    
+    print(f"Dataset created: {dataset_path}")
 
 
-def run_benchmark(table_name, dataset_length, batch_size, num_workers, num_batches=100, 
-                  db_uri="db://my-db", api_key="sk_localtest", host_override="http://internal-k8s-lancedb-lancedbq-09d85d35db-1743442719.us-west-2.elb.amazonaws.com:80",
-                  prefetch_factor=2, epoch=1, row_size=100, config=None):
+def run_benchmark(dataset_path, batch_size, num_workers, num_batches=100, prefetch_factor=2, epoch=1, row_size=100, config=None):
     """Run the benchmark and return metrics."""
     try:
-        # Create dataset
-        dataset = LanceDBMapDataset(
-            table_name=table_name,
-            db_uri=db_uri,
-            api_key=api_key,
-            host_override=host_override
-        )
-        dataset.set_length(dataset_length)
+        dataset = LanceMapDataset(dataset_path)
     except Exception as e:
-        print(f"Error creating LanceDBMapDataset: {e}")
+        print(f"Error creating LanceMapDataset: {e}")
         raise
     
     # Validate prefetch_factor - if 0 or negative, don't set it (use None)
@@ -89,7 +138,7 @@ def run_benchmark(table_name, dataset_length, batch_size, num_workers, num_batch
             print(f"      Warmup batch completed", flush=True)
         warmup_time = time.time() - warmup_start
         print(f"    Warmup completed in {warmup_time:.1f}s", flush=True)
-    
+        
         # Benchmark
         print(f"    Running benchmark (epoch {epoch})...", flush=True)
         batch_times = []
@@ -173,7 +222,7 @@ def run_benchmark(table_name, dataset_length, batch_size, num_workers, num_batch
                 break
         
         total_time = time.time() - start_time
-    
+        
         # Calculate metrics
         batch_times = np.array(batch_times)
         qps = (i + 1) / total_time  # Queries (batches) per second
@@ -206,7 +255,6 @@ def run_benchmark(table_name, dataset_length, batch_size, num_workers, num_batch
         # Force garbage collection to clean up resources
         gc.collect()
 
-
 TEST_CONFIGS = [
     # Test 0: 1 col, 10B, 32K batch, 1K batches, 32M rows, ~305 MB
     {"columns": 1, "data_size": 10, "batch_size": 32000, "total_batches": 1000},
@@ -216,7 +264,7 @@ TEST_CONFIGS = [
     {"columns": 1, "data_size": 100, "batch_size": 16000, "total_batches": 1000},
     # Test 3: 1 col, 100B, 16K batch, 10K batches, 160M rows, ~15 GB
     {"columns": 1, "data_size": 100, "batch_size": 16000, "total_batches": 10000,
-     "dataset_override": "col1_data100_batch10000_perbatch16000",  # Use specific dataset
+     "dataset_override": "col1_data100_batch10000_perbatch16000.lance",  # Use specific dataset
      "override_batch_size": 8000,  # Override batch size to 8K
      "override_total_batches": 20000},  # Override to 20K batches
     # Test 4: 1 col, 1KB, 8K batch, 1K batches, 8M rows, ~8 GB
@@ -251,6 +299,8 @@ TEST_CONFIGS = [
     {"columns": 100, "data_size": 100, "batch_size": 4000, "total_batches": 1000},
     # Test 19: 100 cols, 1KB, 1K batch, 1K batches, 1M rows, ~100 GB
     {"columns": 100, "data_size": 1024, "batch_size": 1000, "total_batches": 1000},
+    # Test 20: 10 cols, 100KB, 1K batch, 128 batches, 128K rows, ~128 GB
+    {"columns": 10, "data_size": 102400, "batch_size": 1000, "total_batches": 128},
 ]
 
 
@@ -307,7 +357,7 @@ def write_results_to_csv(config, metrics, epoch, csv_file="benchmark_results.csv
         # Write data row
         row = [
             datetime.now().isoformat(),
-            "Remote",  # Changed from "Storage" to "Remote"
+            "Storage",
             epoch,
             config['columns'],
             config['data_size'],
@@ -329,21 +379,21 @@ def write_results_to_csv(config, metrics, epoch, csv_file="benchmark_results.csv
         writer.writerow(row)
 
 
-def run_single_test(config, db_uri="db://my-db", api_key="sk_localtest", 
-                   host_override="http://internal-k8s-lancedb-lancedbq-09d85d35db-1743442719.us-west-2.elb.amazonaws.com:80", 
-                   num_epochs=1):
+def run_single_test(config, data_dir="./lance_data", num_epochs=1):
     """Run a single test configuration."""
     # Check for dataset override in config
     if 'dataset_override' in config:
-        # Use the override dataset path (remove .lance extension if present)
+        # Use the override dataset path
         table_name = config['dataset_override'].replace('.lance', '')
+        dataset_path = f"{data_dir}/{config['dataset_override']}"
         actual_batch_size = config.get('override_batch_size', config['batch_size'])
         actual_total_batches = config.get('override_total_batches', config['total_batches'])
         print(f"  NOTE: Using override dataset {table_name}")
         print(f"        with batch_size={actual_batch_size}, batches={actual_total_batches}")
     else:
-        # Generate table name normally (without .lance extension)
+        # Generate table name normally
         table_name = f"col{config['columns']}_data{config['data_size']}_batch{config['total_batches']}_perbatch{config['batch_size']}"
+        dataset_path = f"{data_dir}/{table_name}.lance"
         actual_batch_size = config['batch_size']
         actual_total_batches = config['total_batches']
     
@@ -362,29 +412,13 @@ def run_single_test(config, db_uri="db://my-db", api_key="sk_localtest",
     print(f"  Total dataset size: {total_dataset_size_mb:.2f} MB")
     print(f"  Workers: {config['num_workers']}")
     
-    # Connect to remote LanceDB
-    db = lancedb.connect(db_uri, api_key=api_key, host_override=host_override)
-    
-    # Check if table exists
-    print(f"Using existing table: {table_name}")
-    try:
-        existing_tables = list(db.table_names(limit=1000))  # Get up to 1000 tables
-        print(f"  Found {len(existing_tables)} tables in DB")
-        if table_name not in existing_tables:
-            print(f"ERROR: Table '{table_name}' does not exist in LanceDB!")
-            print(f"Available tables: {existing_tables}")
-            raise ValueError(f"Table '{table_name}' not found. Please create it first.")
-        
-        # Open the table to verify it exists
-        table = db.open_table(table_name)
-        print(f"  Table opened successfully")
-        
-        # Use the expected row count since we can't always get actual count
-        dataset_length = total_rows
-        print(f"  Using expected row count: {dataset_length:,}")
-    except Exception as e:
-        print(f"ERROR: Failed to access table '{table_name}': {e}")
-        raise
+    # Create dataset if needed
+    create_dataset_if_needed(
+        total_rows, 
+        config['columns'], 
+        config['data_size'], 
+        dataset_path
+    )
     
     # Run benchmark for each epoch
     all_metrics = []
@@ -393,15 +427,11 @@ def run_single_test(config, db_uri="db://my-db", api_key="sk_localtest",
             print(f"\n  === Epoch {epoch}/{num_epochs} ===")
         
         metrics = run_benchmark(
-            table_name,
-            dataset_length,
+            dataset_path, 
             actual_batch_size,  # Use actual_batch_size instead of config['batch_size']
             config['num_workers'], 
             actual_total_batches,  # Use actual_total_batches
-            db_uri=db_uri,
-            api_key=api_key,
-            host_override=host_override,
-            prefetch_factor=config['prefetch_factor'],
+            config['prefetch_factor'],
             epoch=epoch,
             row_size=row_size,
             config=config
@@ -428,14 +458,8 @@ def run_single_test(config, db_uri="db://my-db", api_key="sk_localtest",
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--db-uri", type=str, default="db://my-db", 
-                       help="LanceDB database URI")
-    parser.add_argument("--api-key", type=str, default="sk_localtest",
-                       help="API key for LanceDB")
-    parser.add_argument("--host-override", type=str, default="http://internal-k8s-lancedb-lancedbq-09d85d35db-1743442719.us-west-2.elb.amazonaws.com:80",
-                       help="Host override for LanceDB endpoint")
-    parser.add_argument("--num-workers", type=int, default=4, 
-                       help="Number of dataloader workers")
+    parser.add_argument("--data-dir", type=str, default="./lance_data")
+    parser.add_argument("--num-workers", type=int, default=4, help="Number of dataloader workers")
     parser.add_argument("--epochs", type=int, default=1,
                        help="Number of epochs to run for each test")
     parser.add_argument("--prefetch-factor", type=int, default=2,
@@ -467,7 +491,7 @@ def main():
         print(f"This may cause:")
         print(f"  - System resource exhaustion")
         print(f"  - Slower performance due to overhead")
-        print(f"  - Remote API request throttling")
+        print(f"  - S3 request throttling")
         print(f"Consider using 8-32 workers for optimal performance.\n")
     
     # Determine which tests to run
@@ -484,8 +508,7 @@ def main():
         tests_to_run = [(i, cfg) for i, cfg in tests_to_run if i not in skip_set]
         print(f"Skipping test indices: {sorted(args.skip_indices)}")
     
-    print(f"Database URI: {args.db_uri}")
-    print(f"Host override: {args.host_override}")
+    print(f"Data directory: {args.data_dir}")
     print(f"Global num_workers: {args.num_workers}")
     print(f"Global prefetch_factor: {args.prefetch_factor}")
     print(f"Epochs per test: {args.epochs}")
@@ -504,7 +527,7 @@ def main():
         config['test_idx'] = idx
         
         try:
-            run_single_test(config, args.db_uri, args.api_key, args.host_override, args.epochs)
+            run_single_test(config, args.data_dir, args.epochs)
             # Force garbage collection after each test
             gc.collect()
         except Exception as e:
@@ -527,8 +550,7 @@ def main():
                 f.write(f"  Total Rows: {config['batch_size'] * config['total_batches']:,}\n")
                 f.write(f"  Workers: {config['num_workers']}\n")
                 f.write(f"  Prefetch Factor: {config['prefetch_factor']}\n")
-                f.write(f"  DB URI: {args.db_uri}\n")
-                f.write(f"  Host Override: {args.host_override}\n")
+                f.write(f"  Data Directory: {args.data_dir}\n")
                 f.write(f"\nError:\n{error_msg}\n")
                 f.write(f"{'='*80}\n")
             
